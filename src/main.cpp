@@ -141,6 +141,11 @@ bool f_ir_available = false;              //赤外線利用可能フラグ
 bool f_ir_rcv_enable = false;             //受信コントロールフラグ
 String current_directory;                 //カレントディレクトリー保存用
 
+bool f_cat_send_bin = false;              //バイナリーデータの表示用フラグ
+bool f_send_bin_start = false;            //バイナリーデータ送出開始フラグ
+unsigned long enter_time2, wait_time2;    //タイムアウトチェック用
+String gbl_path;                          //ファイルパス名
+
 
 /**
  * @brief Arduino setup
@@ -250,16 +255,75 @@ void IRAM_ATTR onTickTimerISR(void)
  */
 void MainWork_Callback(void)
 {
-  // シリアルに受信データあるか確認
-  int available = Serial.available();
-  if(available > 0)
-  { //受信文字あり
-    char buffer[32];                                                          //入力バッファー、一度に読み込む最大サイズ 
-    int to_read;                                                              //実際に読み込む文字数
-    
-    to_read = (available > (int)sizeof(buffer))? sizeof(buffer) : available;  //バッファサイズを超えないように、読み込む文字数を決定
-    int n = Serial.readBytes(buffer, to_read);                                //文字の読込み
-    microrl_processing_input(&mrl, buffer, n);                                //第３引数に「読み込んだ文字数 n」指定してmicrorlに渡す
+  if(!f_cat_send_bin)
+  { //cat コマンドでバイナリー表示のフラグが立っていない場合
+    // シリアルに受信データあるか確認
+    int available = Serial.available();
+    if(available > 0)
+    { //受信文字あり
+      char buffer[32];                                                          //入力バッファー、一度に読み込む最大サイズ 
+      int to_read;                                                              //実際に読み込む文字数
+      
+      to_read = (available > (int)sizeof(buffer))? sizeof(buffer) : available;  //バッファサイズを超えないように、読み込む文字数を決定
+      int n = Serial.readBytes(buffer, to_read);                                //文字の読込み
+      microrl_processing_input(&mrl, buffer, n);                                //第３引数に「読み込んだ文字数 n」指定してmicrorlに渡す
+    }
+  }
+  else
+  { //cat コマンドでバイナリー表示の要求がある場合
+    if(0 >= Serial.available())
+    { //シリアルから受信文字なし
+      if((millis() - enter_time2) >= wait_time2)
+      { //送信タイムアウト      
+        Serial.printf_P(PSTR("Timeout for binary output using the `cat` command.\r\n"));
+        gbl_path.clear();
+        f_send_bin_start = false;
+        f_cat_send_bin = false;
+        microrl_processing_input(&mrl, &init_key, 1); //ＬＦを送ってプロンプト「esp8266>」を出力させる
+      }  
+    }
+    else
+    { //シリアルから受信文字あり
+      int c = Serial.read();
+      if('\n' == c)
+      { //LF コードが確認された
+        while(0 < Serial.available())
+          Serial.read();                              //受信データ空になるまで、読み捨てる
+        f_send_bin_start = true;
+      }
+    }
+
+    if(f_send_bin_start)
+    { //バイナリーデータの送出
+      File file;
+      #if(0)
+      Serial.printf_P(PSTR("Out put file = %s\r\n"), gbl_path.c_str());
+      #endif
+
+      //ファイルを開く
+      file = LittleFS.open(gbl_path, "r");
+      if(!file)
+      { //オープン失敗
+        Serial.printf_P(PSTR("[e] Failed to open file(%s)!\r\n"), gbl_path.c_str());
+        microrl_processing_input(&mrl, &init_key, 1);                 //ＬＦを送ってプロンプト「esp8266>」を出力させる
+      }
+      else
+      { //オープン成功
+        uint8_t c;
+        while(file.available())
+        { c = file.read();
+          Serial.printf("%c", c);
+        }
+        file.close();
+      }
+
+      gbl_path.clear();
+      f_cat_send_bin = false;
+      f_send_bin_start = false;
+      #if(0)
+      microrl_processing_input(&mrl, &init_key, 1);                 //ＬＦを送ってプロンプト「esp8266>」を出力させる
+      #endif
+    }
   }
 
   //約１秒ごとの処理があればここに
@@ -1132,14 +1196,15 @@ void cmd_fs_view(int argc, const char* const* argv)
   JsonDocument jdoc;
   DeserializationError jerr;
   String path;
-  bool f_opt;
+  bool f_opt, f_end_wait;
   bool f_json_type_file;
 
   if(argc < 2)
-  { Serial.printf_P(PSTR("Usage: cat <file path> <option: -v, -j, -x>\r\n"));
+  { Serial.printf_P(PSTR("Usage: cat <file path> <option: -v, -j, -x, -b> <end wait: 1..10S/20S>\r\n"));
     return;
   }
-  if(argc == 3) f_opt = true; else f_opt = false;
+  if(argc >= 3) f_opt = true;      else f_opt = false;
+  if(argc == 4) f_end_wait = true; else f_end_wait = false;
 
   if(!f_littlefs_available)
   { //ファイルシステムの準備ができていない
@@ -1298,6 +1363,15 @@ void cmd_fs_view(int argc, const char* const* argv)
     }
     else
 
+    if(f_opt && (0 == strcmp("-b", argv[2])))
+    { //すべてをそのまま出力するための段取り
+      f_send_bin_start = false;
+      f_cat_send_bin = true;
+      gbl_path = path;          //ファイルのパスをコピー（バイナリ送信時に利用する）
+      wait_time2 = 0;
+      enter_time2 = millis();   //現在の時間をミリ秒で取得
+    } else
+
     if(f_opt && (0 == strcmp("-j", argv[2])) && f_json_type_file)
     { //JSON 整形された形式で表示
       Serial.printf_P(PSTR("--- Json >>>\r\n"));
@@ -1313,7 +1387,7 @@ void cmd_fs_view(int argc, const char* const* argv)
       while(file.available())
       { c = file.read();
         if((0x20 > c) || (0x7F < c) || (0x7F == c))
-        { if(('\r' == c) || ('\n' == c) || ('\t'))
+        { if(('\r' == c) || ('\n' == c) || ('\t' == c))
           { //これらはそのまま出力
             Serial.print((char)c);
             count++;
@@ -1321,7 +1395,6 @@ void cmd_fs_view(int argc, const char* const* argv)
           }
           else
           { Serial.print('.');
-            count++;
           }
         }
         else
@@ -1336,6 +1409,30 @@ void cmd_fs_view(int argc, const char* const* argv)
       Serial.println();
     }
     file.close();
+
+    //終了前に一定時間を待って終了するか否か（バイナリーデータをＰＣなどで取得するとき、ログなどを終了するまでの猶予時間に使える）
+    if(f_end_wait && !f_cat_send_bin && (0 < atoi(argv[3])) && (11 > atoi(argv[3])))
+    { //コマンド終了待ち時間あり
+      unsigned long enter_time, wait_time;
+      
+      wait_time = atoi(argv[3]) * 1000; //待ち時間をミリ秒にする
+      enter_time = millis();            //現在の時間をミリ秒で取得
+      while((millis() - enter_time) < wait_time)
+      { yield(); 
+      }
+    } else
+    if(f_end_wait && f_cat_send_bin && (0 < atoi(argv[3])) && (21 > atoi(argv[3])))
+    {
+      wait_time2 = atoi(argv[3]) * 1000; //タイムアウト時間をミリ秒にする
+      Serial.printf_P(PSTR("Binary output will occur either upon receiving the character code “LF” or after %s seconds.\r\n"), argv[3]);
+    } else
+    if(f_cat_send_bin)
+    {
+      wait_time2 = 15000; //デフォルト値タイムアウト時間をミリ秒にする
+      Serial.printf_P(PSTR("Binary output will occur either upon receiving the character code “LF” or after 15 seconds.\r\n"));
+    }
+
+    Serial.println();
   }
 }
 
