@@ -1387,7 +1387,7 @@ void cmd_fs_view(int argc, const char* const* argv)
       while(file.available())
       { c = file.read();
         if((0x20 > c) || (0x7F < c) || (0x7F == c))
-        { if(('\r' == c) || ('\n' == c) || ('\t' == c))
+        { if(('\r' == c) || ('\n' == c) /*|| ('\t' == c)*/)
           { //これらはそのまま出力
             Serial.print((char)c);
             count++;
@@ -1395,6 +1395,7 @@ void cmd_fs_view(int argc, const char* const* argv)
           }
           else
           { Serial.print('.');
+            count++;
           }
         }
         else
