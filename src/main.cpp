@@ -77,6 +77,7 @@ void cmd_fs_rename_file(int argc, const char* const* argv);
 void cmd_fs_disk_info(int argc, const char* const* argv);
 void cmd_fs_save_ir(int argc, const char* const* argv);
 void cmd_fs_load_ir(int argc, const char* const* argv);
+void cmd_fs_remove_ir(int argc, const char* const* argv);
 void cmd_fs_view(int argc, const char* const* argv);
 void cmd_fs_change_dir(int argc, const char* const* argv);
 void cmd_fs_crr_dir_info(int argc, const char* const* argv);
@@ -113,6 +114,7 @@ static const command_t commands[] = {
   {"irrx",    cmd_ir_rcv_cntl,    "IR recv control"},
   {"irsv",    cmd_fs_save_ir,     "Save IR data to FS"},
   {"irld",    cmd_fs_load_ir,     "Load IR data from FS"},
+  {"irrm",    cmd_fs_remove_ir,   "Remove IR data from FS"},
 
   {"ls",      cmd_fs_dir,         "List of files"},
   {"cat",     cmd_fs_view,        "View file Contents"},
@@ -779,7 +781,7 @@ void cmd_fs_save_ir(int argc, const char* const* argv)
     //オープン成功：最初のデータ登録になるので、Jsonフォーマットを作成そ保存する
     jdoc.clear();                         //JSON doc クリア
     root = jdoc.to<JsonObject>();         //オブジェクト化する, {}
-    root["next_id"] = 1;                  //{"next_id":1}
+    root["next_id"] = 1;                  //{"next_id":1} ID は１から始まる
     array = root["list"].to<JsonArray>(); //{"next_id":1, list:[]}
     serializeJson(jdoc, file);            //JSON doc をファイルに保存
     file.close();
@@ -1622,6 +1624,202 @@ void cmd_fs_load_ir(int argc, const char* const* argv)
     else
     {
       Serial.printf_P(PSTR("[e] Load mismatch! %d / %d\r\n"), (int)read_byte, (int)sizeof(IRDataRecord));
+    }
+  }
+}
+
+
+
+
+/**
+ * @brief ファイルシステムから赤外線データを削除
+ *  {
+ *     "next_id":1,
+ *     "list":[
+ *        {"id":1, "model":"xxx", "function":"power", "ffpath":"/IRCdata/ir0001.ird"},
+ *        ・・・・
+ *     ]
+ *  }
+ * @param argc コマンドとパラメーターの数
+ * @param argv コマンド、メーカー名、機種名、ボタン名
+ */
+void cmd_fs_remove_ir(int argc, const char* const* argv)
+{
+  File file;
+  JsonDocument jdoc;
+  JsonArray array;
+  DeserializationError jerr;
+  String file_path, file_maker_path;
+  int found_id, match_count;
+  bool found, optional, id_match, exec_del_file;
+
+  if(argc < 4)
+  { Serial.printf_P(PSTR("Usage: irrm <maker> <model> <function> <ID:Optional>\r\n"));
+    return;
+  }
+
+  optional = false;
+  if(argc == 5) optional = true;
+
+  if(!f_littlefs_available)
+  { //ファイルシステムの準備ができていない
+    Serial.printf_P(PSTR("[e] Not available the LittleFS!!\r\n"));
+    return;
+  }
+
+  file_maker_path.clear();
+  file_maker_path = "/IRCdata/" + String(argv[1]) + ".lst";
+
+  if(!LittleFS.exists(file_maker_path))
+  { //ファイルが存在しない
+    Serial.printf_P(PSTR("[e] File(%s) could not be found!\r\n"), file_maker_path.c_str());
+    return;
+  }
+
+  file = LittleFS.open(file_maker_path, "r");
+  if(!file)
+  { //指定のメーカー赤外線データリストファイルがない
+    Serial.printf_P(PSTR("[e] Failed to open file(%s)!\r\n"), file_maker_path.c_str());
+    return;
+  }
+  else
+  { //ファイルオープン成功
+    if(file.isDirectory())
+    { Serial.printf_P(PSTR("[!] This name is not a file.(%s)!\r\n"), file_maker_path.c_str());
+      file.close();
+      return;
+    }
+    
+    //ファイルからJSONデータを取得
+    jerr = deserializeJson(jdoc, file);
+    file.close();
+
+    if(DeserializationError::Ok != jerr.code())
+    { Serial.printf_P(PSTR("[e] IR data table deserialization failed! %s\r\n"), jerr.f_str());
+      return;
+    }
+    Serial.printf_P(PSTR("[i] IR data table deserialization succeeded.\r\n"));
+  }
+
+  found_id = 0;
+  found = false;
+  match_count = 0;
+  array = jdoc["list"].as<JsonArray>();  //"list"をJsonArrayとして取り込む
+  //配列内をループで回して検索
+  for(JsonObject ir_item : array)
+  { //model と function の両方が一致するかチェック
+    if(ir_item["id"].is<int>())
+    { //id というキーが存在し数値である
+      id_match = (optional)? (atoi(argv[4]) == ir_item["id"].as<int>()) : true;   //ID チェックオプションがある場合　IDの照合を行う
+      if((0 == strcmp(ir_item["model"], argv[2])) && (0 == strcmp(ir_item["function"], argv[3])) && id_match)
+      { //一致するデータがあった ffpath を取得
+        file_path.clear();
+        file_path = ir_item["ffpath"].as<String>();
+        found_id = ir_item["id"].as<int>();
+        found = true;
+        match_count++;
+        Serial.printf_P(PSTR("[i] Match ID(%d): model(%s), function(%s), file(%s)\r\n"), found_id, argv[2], argv[3], file_path.c_str());
+      }
+    }
+  }
+  Serial.println();
+
+  if(!found)
+  { //リモコン登録がない
+    Serial.printf_P(PSTR("[e] model(%s), function(%s) could not be found!\r\n"), argv[2], argv[3]);
+  }
+  else
+  { //リモコン登録がある
+    if(1 != match_count)
+    { //一致した項目が複数ある
+      Serial.printf_P(PSTR("[!] There are multiple matching items.\r\n"));
+      Serial.printf_P(PSTR("[!] Please include the ID of the item you want to delete when executing this command.\r\n"));
+      Serial.printf_P(PSTR("    Usage: irrm <maker> <model> <function> <ID>\r\n"));
+    }
+    else
+    { //一致した項目が１個の場合
+      Serial.printf_P(PSTR("[i] Registration has been found. Remote control data and registration will be deleted.\r\n"));
+      Serial.printf_P(PSTR("[i] Delete ID(%d): model(%s), function(%s), file(%s)\r\n"), found_id, argv[2], argv[3], file_path.c_str());
+      Serial.printf_P(PSTR("[!] If you confirm, please press the (Y) key within 10 seconds.\r\n"));
+
+      bool tmout;
+      unsigned long enter_time = millis();  //現在の時間をミリ秒で取得
+      tmout = true;
+      while((millis() - enter_time) < 10000)
+      {
+        if(0 < Serial.available())
+        { //シリアルから受信文字あり
+          int c = Serial.read();
+          if('Y' == c)
+          { //LF コードが確認された
+            while(0 < Serial.available())
+              Serial.read();                //受信データ空になるまで、読み捨てる
+            tmout = false;
+            break;
+          }
+        }
+        yield(); 
+      }
+      Serial.println();
+
+      exec_del_file = false;
+      if(tmout)
+      { //タイムアウト発生
+        Serial.printf_P(PSTR("[!] (Y) could not be verified. Deletion process will be aborted.\r\n"));
+      }
+      else
+      { //JSON オブジェクトの削除と対象のIRデータファイル削除
+        for(size_t r=0; r<array.size(); r++)
+        { //配列内のオブジェクトを確認
+          if(found_id == array[r]["id"])
+          { //ターゲットの登録ＩＤが一致
+            if(file_path == array[r]["ffpath"].as<String>())
+            { //１次チェック時のファイルパスと、今回のパスが一致
+              Serial.printf_P(PSTR("[!] Deleted object index(%d): ID(%d), model(%s), function(%s), file(%s)\r\n"), r, found_id,
+                (array[r]["model"].as<String>()).c_str(), (array[r]["function"].as<String>()).c_str(), (array[r]["ffpath"].as<String>()).c_str());
+              array.remove(r);
+
+              //赤外線データの更新保存
+              if(!LittleFS.exists(file_maker_path))
+              { //ファイルが存在しない
+                Serial.printf_P(PSTR("[e] File(%s) could not be found!\r\n"), file_maker_path.c_str());
+                return;
+              }
+              else
+              { //ファイルがある
+                file = LittleFS.open(file_maker_path, "w"); //ファイル上書き
+                if(!file)
+                { //赤外線データ保存用リストファイルオープン失敗
+                  Serial.printf_P(PSTR("[e] Failed to open(w) file(%s)!\r\n"), file_maker_path.c_str());
+                  return;
+                }
+
+                //オープン成功：Json 更新データを保存する
+                serializeJson(jdoc, file);  //JSON doc をファイルに保存
+                file.close();
+                exec_del_file = true;
+              }
+            }
+            else
+            { //１次チェック時のファイルパスと、今回のパスが「不一致」
+              Serial.printf_P(PSTR("[e] Deletion criteria do not match, so the process has been interrupted.\r\n"));
+              exec_del_file = false;
+            }
+            break;  //削除後抜ける
+          }
+        }
+
+        if(exec_del_file)
+        { //ファイルの削除処理
+          Serial.printf_P(PSTR("[i] Deleting file: %s\r\n"), file_path.c_str());
+          if(LittleFS.remove(file_path.c_str()))
+          { Serial.printf_P(PSTR("[!] Deletion process is complete.\r\n"));
+          }
+          else
+          { Serial.printf_P(PSTR("[e] Deletion process is failed!\r\n"));
+          }
+        }
+      }
     }
   }
 }
