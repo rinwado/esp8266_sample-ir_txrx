@@ -1,0 +1,28 @@
+/**
+ * ネットワーク関係の環境を設定するヘッダー
+ * for PlatformIO
+ * 
+ * 2026-05-10
+ * net_env.h
+ * Copyright (c) 2026 rinwado
+ * Licensed under the MIT License.
+ * See LICENSE file in the project root for full license text.
+ */
+
+#ifndef __X_NET_ENV_H__
+#define __X_NET_ENV_H__
+
+#define WIFI_SSID          "Your SSID"          //47文字以内
+#define WIFI_VERI_WORD     "Your password"      //47文字以内
+#define WIFI_FIX_IP        "192.168.100.1"      //設定るIP
+#define WIFI_FIX_SNM       "255.255.255.0"      //サブネットマスク
+#define WIFI_FIX_GW        "192.168.100.200"    //ゲートウエイ
+#define WIFI_FIX_DNS       "192.168.100.200"    //ネームサーバー
+
+
+//--- Blynk コンソールから取得し記載
+#define BLYNK_TEMPLATE_ID "..."
+#define BLYNK_TEMPLATE_NAME "..."
+#define BLYNK_AUTH_TOKEN "..."
+ 
+#endif  //__X_NET_ENV_H__

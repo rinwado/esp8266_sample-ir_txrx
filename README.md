@@ -4,6 +4,9 @@
 - **赤外線受送信**: IRremoteESP8266ライブラリーを利用した、赤外線受信・送信を行うことができます。
 - **ファイルシステム**: LittleFSライブラリーを利用し、赤外線データの保存・読込、赤外線出力データはJSONで管理。また、コマンドによるファイル操作ができる。
 - **コマンド**: コマンド処理には、microrlライブラリーを利用し各種コマンドの処理を実装しています。
+- **Wi-Fi/Blynk**: Wi-Fiへの接続および Blynk Cloud への接続ができます。Blynk Cloud 経由での制御・データ収集します。  
+- &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;２つのデータストリームにADC/SWデータをアップロードし、Blynk Cloud からの制御で赤外線出力が可能です。
+- **時刻**: Wi-Fiへの接続が完了すると、NTPサーバーから時刻を取得し、ESP8266のRTCにセットします。
 
 ## 動作環境
 - **ハードウェア**: 
@@ -12,10 +15,13 @@
 - **開発ツール**: PlatformIO (VSCode)
 - **使用ライブラリ**: 
   - [TaskScheduler](https://github.com/arkhipenko/TaskScheduler)
-  - Ticker (ESP8266 Core内蔵)
+  - Ticker (ESP8266 Arduino Core 標準)
+  - LittleFS (ESP8266 Arduino Core 標準)
   - IRremoteESP8266
   - ArduinoJson
   - [microrl](https://github.com/dimmykar/microrl-remaster.git)
+  - Blynk
+  - NTPClient
 
 ## 接続設定
 - **LEDピン**: GPIO16 (ボード上のJP1をLED側に設定)
@@ -47,6 +53,8 @@
 - **cmd-irsv**: 受信した赤外線データをファイルに保存。　irsv メーカー名　機種名　機能名　を指定して保存します
 - **cmd-irld**: ファイルに保存された赤外線データの読込とデータ出力確認を行う。irld メーカー名　機種名　機能名　テスト を指定してファイルから読込ます
 - **cmd-irrm**: 赤外線データの削除。irrm メーカー名　機種名　機能名　ID（オプション） を指定して削除対象のJSONオブジェクト及び赤外データファイルを削除します。
+- **cmd-snd2bc**: Blynk Cloud へのデータアップロード許可・禁止。snd2bc on / off on:許可、off:禁止
+- **cmd-ntim**: 現在の時刻を表示します。
 - **cmd-ls**: ディレクトリーやファイルの一覧を表示。ls は現在のディレクトリ、ls /xxx/yyy は絶対パスでの指定
 - **cmd-cat**: ファイルの内容を表示します。（cat ファイル名　オプション 時間）現在のディレクトリのファイル、または絶対パス指定。  
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;-v:制御文字可視、-j:Json整形、-x:HEX表示、-b:バイナリ送出,

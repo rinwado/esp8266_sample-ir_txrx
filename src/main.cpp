@@ -6,7 +6,7 @@
  * 対応ボード：IOT Integrated Controller V1
  *            RRH-G101A REV-B
  * 
- * 2026-05-05
+ * 2026-05-10
  * Copyright (c) 2026 rinwado
  * Licensed under the MIT License.
  * See LICENSE file in the project root for full license text.
@@ -16,6 +16,7 @@
 #include <LittleFS.h>
 #include <Ticker.h>
 #include <TaskScheduler.h>
+#include <sys/time.h>
 #include <time.h>
 #include <IRremoteESP8266.h>
 #include <IRutils.h>
@@ -25,22 +26,47 @@
 #include <IRsend.h>
 #include <microrl.h>
 #include <ArduinoJson.h>
+#include "net_env.h"
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <time.h>
+
 
 
 /// 定義
-#define TICK_PP_MS                (3.333F)              //ティッカー周期　ｍS
-#define TICK_PP_SEC               (TICK_PP_MS/1000.0F)  //ティッカー周期　ｍS
-#define LED_PIN                   (16)                  //ＬＥＤピン（ボードのＪＰ１は「ＬＥＤ」側にする）
-#define IR_RECV_PIN               (14)                  //赤外線信号入力ピン
-#define IR_SEND_PIN               (15)                  //赤外線出力信号ピン
-#define IR_CAPTURE_BUF_SIZE       (1024)                //保存バッファ機能を有効にすると、より完全なキャプチャ範囲を確保できます。
-#define IR_RECV_TIMEOUT           (50)                  //50ms, 一部のエアコンでは、プロトコルの間隔が約40ミリ秒開いている場合がある
-#define IR_RECV_MIN_UNKNOWN_SIZE  (12)                  //値を非常に高く設定すると、UNKNOWNの検出を事実上無効
-#define IR_TOLERANCE              (25)                  //許容誤差は通常25%
-#define IR_RAW_DATA_BUFFER        (1024)                //RAWデータの保存用バッファー数
+#define TICK_PP_MS                (3.333F)                //ティッカー周期　ｍS
+#define TICK_PP_SEC               (TICK_PP_MS/1000.0F)    //ティッカー周期　ｍS
+#define LED_PIN                   (16)                    //ＬＥＤピン（ボードのＪＰ１は「ＬＥＤ」側にする）
+#define IR_RECV_PIN               (14)                    //赤外線信号入力ピン
+#define IR_SEND_PIN               (15)                    //赤外線出力信号ピン
+#define IR_CAPTURE_BUF_SIZE       (1024)                  //保存バッファ機能を有効にすると、より完全なキャプチャ範囲を確保できます。
+#define IR_RECV_TIMEOUT           (50)                    //50ms, 一部のエアコンでは、プロトコルの間隔が約40ミリ秒開いている場合がある
+#define IR_RECV_MIN_UNKNOWN_SIZE  (12)                    //値を非常に高く設定すると、UNKNOWNの検出を事実上無効
+#define IR_TOLERANCE              (25)                    //許容誤差は通常25%
+#define IR_RAW_DATA_BUFFER        (1024)                  //RAWデータの保存用バッファー数
+#define WIFI_FIXED_STR_LEN_MAX    (48)                    //NULLターミネータ含めた文字数
+#define JST_OFFSET                (9 * 3600)              //9時間 × 3600秒
+#define NTP_SERVER                "ntp.nict.jp"
+#define NOF_TICK_CNT(ms)          (ms / 3.333)            //指定したｍｓ時間が Ticker 割込みでのカウントがいくつに相当するか
+#define TICK_COUNTER_PAR_30MIN    ((30*60*1000) / 3.333)  //時刻更新間隔
+#define ADC_VCC_MODE              (1)                     //1:ADCの入力がチップ内部の電源ラインを読む、 0:ADCの入力が外部のA0ピンの値を読む
+#define ADC_A0_1LSB_MV            (0.976562F)             //1000mV ÷ 1024
+#define IO0_PIN                   (0)                     //プログラムボタンと兼用[SW2/IN1]しているので、起動時の検出はできない
 
 /// マクロ
-#define TICK_CNT_FROM_MS(t)       (t/TICK_PP_MS)        //ミリ秒からカウント数を得る
+#define TICK_CNT_FROM_MS(t)       (t/TICK_PP_MS)          //ミリ秒からカウント数を得る
+
+
+/// ESP8266 ADC 設定
+#if(ADC_VCC_MODE)
+ADC_MODE(ADC_VCC);                                        //ADCは内部のVCC電圧を測定するモードにする（コンパイル時の設定可能）
+#define ESP8266_ADC_READ  ESP.getVcc()                    //内部のVCC電圧を読み出す場合
+#else
+#define ESP8266_ADC_READ  analogRead(A0)                  //通常のＡ０端子のアナログ入力を読み出す
+#endif
+
 
 /// 構造体
 struct IRDataRecord
@@ -64,11 +90,40 @@ typedef struct
   const char* help;                                     //ヘルプ文
 } command_t;
 
+typedef struct wifi_setting_val
+{
+    bool f_dhcp;
+    //bool f_secure;
+    char ConnectSSID[WIFI_FIXED_STR_LEN_MAX];
+    char ConnectSSID_Pass[WIFI_FIXED_STR_LEN_MAX];
+    IPAddress wfixIP;
+    IPAddress wfixGW;
+    IPAddress wfixSNM;
+    IPAddress wfixDNS;
+    char WiFi_mac[8];
+    char WiFi_mac_str[32];
+} wifi_setting_val_t;
+
+/// 列挙型
+enum wState
+{	//Wi-Fi ステート
+	WIFI_CSTART = 0,
+	WIFI_CLIENT_PROC_ENT,
+	WIFI_CONNECT_CHK,
+	WIFI_TRY_CONNECT_TO_AP,
+	WIFI_CONNECT_OKNG,
+
+  WIFI_WAIT_PROCESS,
+	WIFI_OHTER_PROCESS,
+};
+
 /// コマンドの処理関数 プロトタイプ宣言
 void cmd_help(int argc, const char* const* argv);
 void cmd_led_spd(int argc, const char* const* argv);
 void cmd_ir_rcv_cntl(int argc, const char* const* argv);
 void cmd_fs_dir(int argc, const char* const* argv);
+void cmd_send2blynk(int argc, const char* const* argv);
+void cmd_get_now_time(int argc, const char* const* argv);
 void cmd_fs_remove(int argc, const char* const* argv);
 void cmd_fs_remove_dir(int argc, const char* const* argv);
 void cmd_fs_create_dir(int argc, const char* const* argv);
@@ -115,6 +170,8 @@ static const command_t commands[] = {
   {"irsv",    cmd_fs_save_ir,     "Save IR data to FS"},
   {"irld",    cmd_fs_load_ir,     "Load IR data from FS"},
   {"irrm",    cmd_fs_remove_ir,   "Remove IR data from FS"},
+  {"snd2bc",  cmd_send2blynk,     "Data send to Blynk ON/OFF"},
+  {"ntim",    cmd_get_now_time,   "Show now time"},
 
   {"ls",      cmd_fs_dir,         "List of files"},
   {"cat",     cmd_fs_view,        "View file Contents"},
@@ -129,9 +186,12 @@ static const command_t commands[] = {
   
 };
 
+
+
 /// 変数
-volatile uint16_t gn_cnt1 = 0;            //汎用カウンタ１
+volatile uint32_t gn_cnt1 = 0;            //汎用カウンタ１
 volatile uint16_t gn_cnt2 = 0;            //汎用カウンタ２
+volatile uint16_t gn_cnt3 = 0;            //汎用カウンタ３
 volatile uint16_t led_speed = 0;          //LED LD4 の点滅スピード設定
 volatile bool f_counter_trigger = false;  //割込みカウンタによるトリガフラグ
 
@@ -148,6 +208,28 @@ bool f_send_bin_start = false;            //バイナリーデータ送出開始
 unsigned long enter_time2, wait_time2;    //タイムアウトチェック用
 String gbl_path;                          //ファイルパス名
 
+wifi_setting_val_t wifi_setting;
+bool f_wifi_connected = false;
+enum wState WiFi_state;
+enum wState WiFi_next_state;
+WiFiClient* WIFI_Client;
+WiFiUDP* ntpUDP_Client;
+NTPClient* NTP_client;
+
+volatile int16_t WiFi_wait_counter;
+volatile int16_t WiFi_ConnectTimeOut_Counter;
+int16_t wait_time;
+char wifi_macAddress[16];
+
+bool f_blynk_connected = false;
+bool f_blynk_send_data = false;
+int16_t blynk_reconnect_wait_time;
+char blynk_auth[] = BLYNK_AUTH_TOKEN;
+
+bool time_sync_start = false;
+const char* weekd[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sta"};  //曜日の定義
+
+
 
 /**
  * @brief Arduino setup
@@ -157,9 +239,14 @@ void setup()
 {
   //--- IOピン設定
   pinMode(LED_PIN, OUTPUT);
+  pinMode(IO0_PIN, INPUT);
 
   //--- 変数初期化
   led_speed = TICK_CNT_FROM_MS(500);
+  f_blynk_connected = false;
+  f_blynk_send_data = false;
+  blynk_reconnect_wait_time = 0;
+  wait_time = 0;
 
   //--- シリアル
   Serial.begin(115200);
@@ -205,6 +292,28 @@ void setup()
     f_ir_available = false;
   }
 
+  //Wi-Fi パラメータ初期化
+  f_wifi_connected = false;
+  wifi_setting.f_dhcp = false;
+  memset(wifi_setting.ConnectSSID, 0, sizeof(wifi_setting.ConnectSSID));
+  strcpy(wifi_setting.ConnectSSID, WIFI_SSID);
+  memset(wifi_setting.ConnectSSID_Pass, 0, sizeof(wifi_setting.ConnectSSID_Pass));
+  strcpy(wifi_setting.ConnectSSID_Pass, WIFI_VERI_WORD);
+  wifi_setting.wfixIP.fromString(WIFI_FIX_IP);    //IPAddress のメンバ関数[fromString]でストリングからIPアドレスに変換
+  wifi_setting.wfixGW.fromString(WIFI_FIX_GW);
+  wifi_setting.wfixSNM.fromString(WIFI_FIX_SNM);
+  wifi_setting.wfixDNS.fromString(WIFI_FIX_DNS);
+
+  WiFi_state = WIFI_CSTART;
+  WiFi_next_state = WIFI_CSTART;
+  WIFI_Client = NULL;
+  ntpUDP_Client = NULL;
+  NTP_client = NULL;
+
+  //Blynk パラメータ初期化
+  f_blynk_connected = false;
+  Blynk.config(blynk_auth);
+
   //--- ティッカーの開始 秒数で指定(0.003333 = 3.333ms, onTimerISR関数をセット)
   tick_timer1.attach(TICK_PP_SEC, onTickTimerISR);
   //--- タスクを有効化
@@ -222,7 +331,226 @@ void loop()
 {
   //--- スケジューラを回す
   TskRunner.execute();
-}
+
+  //--- Wi-Fi/NTP 処理
+  static uint32_t now_free_heap_size = 0;
+  switch(WiFi_state)
+  { //Wi-Fi 接続・切断・再接続の処理ステート
+    case WIFI_CSTART:
+      f_wifi_connected = false;
+      now_free_heap_size = ESP.getFreeHeap();
+      Serial.printf_P(PSTR("[i] Free Heap  size: %d\r\n"), (int)now_free_heap_size);
+      Serial.printf_P(PSTR("[i] WiFiClient size: %d\r\n"), (int)sizeof(WiFiClient));
+      Serial.printf_P(PSTR("[i] WiFiUDP    size: %d\r\n"), (int)sizeof(WiFiUDP));
+      Serial.printf_P(PSTR("[i] NTPClient  size: %d\r\n"), (int)sizeof(NTPClient));
+
+      if(8192 < now_free_heap_size)
+      { //Wi-Fi 関係で 8192byte は、通信バッハーなどでこの先利用するだろうと予測して数値を設定している
+        if(NULL == WIFI_Client)
+        { WIFI_Client = new WiFiClient();
+          if(NULL != WIFI_Client)
+          { //OK
+              WiFi.mode(WIFI_STA);
+              Serial.printf_P(PSTR("[i] WiFi-Mode:STA\r\n"));
+          }
+        }
+
+        if(NULL == ntpUDP_Client)
+        { ntpUDP_Client = new WiFiUDP();
+        }
+
+        if((NULL == NTP_client) && (NULL != ntpUDP_Client))
+        { NTP_client = new NTPClient(*ntpUDP_Client, NTP_SERVER, JST_OFFSET);
+        }
+
+        if((NULL == WIFI_Client) || (NULL == ntpUDP_Client) || (NULL == NTP_client))
+        { //NG
+          Serial.printf_P(PSTR("[e] Failed to create the instance. Will retry in 1 second.\r\n"));
+          wait_time = NOF_TICK_CNT(1000); //1000ms
+          WiFi_wait_counter = 0;
+          WiFi_state = WIFI_WAIT_PROCESS;
+          WiFi_next_state = WIFI_CSTART;
+        }
+        else
+        { //OK
+          NTP_client->setTimeOffset(32400);       //日本の＋９時間分の秒数
+          now_free_heap_size = ESP.getFreeHeap();
+          Serial.printf_P(PSTR("[i] Free Heap  size: %d\r\n"), (int)now_free_heap_size);            
+          WiFi_state = WIFI_CLIENT_PROC_ENT;
+          WiFi_next_state = WIFI_CLIENT_PROC_ENT;
+        }
+      }
+      else
+      { Serial.printf_P(PSTR("[?] There may not be enough heap memory. Will retry in 1 second.\r\n"));
+        wait_time = NOF_TICK_CNT(1000); //1000ms
+        WiFi_wait_counter = 0;
+        WiFi_state = WIFI_WAIT_PROCESS;
+        WiFi_next_state = WIFI_CSTART;
+      }
+    break;
+
+    case WIFI_CLIENT_PROC_ENT:
+      WiFi.disconnect(true);        //WiFi.disconnect(true, true); wifioff	trueを指定すると、ステーションモードを終了する。省略時はfalse。 eraseap	trueを指定すると、WiFiの設定情報を削除する。省略時はfalse。
+      WiFi.setAutoConnect(false);		//電源再投入時に最後に接続されたAPに自動的に接続するか否か：自動接続しない
+      WiFi.setAutoReconnect(false); //APの接続が切れた場合、自動的に再接続するか否か：自動接続しない（既に接続が切れている時に実行してもAPへの再接続はされない）
+
+      if(WiFi.status() != WL_CONNECTED)
+      {	//接続が切れているのを確認
+        f_wifi_connected = false;
+        WiFi_state = WIFI_TRY_CONNECT_TO_AP;
+        WiFi_next_state = WIFI_TRY_CONNECT_TO_AP;
+      }
+      else
+      { wait_time = NOF_TICK_CNT(50); //50ms
+        WiFi_wait_counter = 0;
+        WiFi_state = WIFI_WAIT_PROCESS;
+        WiFi_next_state = WIFI_CLIENT_PROC_ENT;
+      }
+    break;     
+
+    case WIFI_TRY_CONNECT_TO_AP:
+        //ルーター（ＡＰ）への接続（WiFi.begin：デフォルトはDHCP）
+        Serial.printf_P(PSTR("[i] WiFi Try connect.\r\n"));
+        if(!wifi_setting.f_dhcp)
+        { //DHCPでない場合
+            WiFi.config(wifi_setting.wfixIP, wifi_setting.wfixGW, wifi_setting.wfixSNM, wifi_setting.wfixDNS);
+        }
+        WiFi.begin(wifi_setting.ConnectSSID, wifi_setting.ConnectSSID_Pass);
+
+        WiFi_ConnectTimeOut_Counter = NOF_TICK_CNT(30000); //接続タイムアウト時間 30s セット
+        WiFi_state = WIFI_CONNECT_OKNG;
+        WiFi_next_state = WIFI_CONNECT_OKNG;
+
+        now_free_heap_size = ESP.getFreeHeap();
+        Serial.printf_P(PSTR("[i] Free Heap  size: %d\r\n"), (int)now_free_heap_size);   
+    break;
+
+    case WIFI_CONNECT_OKNG:
+      if(WiFi.status() == WL_CONNECTED)
+      {	//接続された
+          WiFi.macAddress((uint8_t*)wifi_setting.WiFi_mac);
+          memset(wifi_macAddress, 0, sizeof(wifi_macAddress));
+          sprintf(wifi_macAddress, "%02X%02X%02X%02X%02X%02X",
+                                              wifi_setting.WiFi_mac[5], wifi_setting.WiFi_mac[4], wifi_setting.WiFi_mac[3],
+                                              wifi_setting.WiFi_mac[2], wifi_setting.WiFi_mac[1], wifi_setting.WiFi_mac[0]);
+          sprintf(wifi_setting.WiFi_mac_str, "%02X:%02X:%02X:%02X:%02X:%02X",
+                                              wifi_setting.WiFi_mac[5], wifi_setting.WiFi_mac[4], wifi_setting.WiFi_mac[3],
+                                              wifi_setting.WiFi_mac[2], wifi_setting.WiFi_mac[1], wifi_setting.WiFi_mac[0]);
+          Serial.printf_P(PSTR("\r\n[i] WiFi connected.\r\n"));
+          Serial.printf_P(PSTR("[i] MAC address    : %s\r\n"), wifi_setting.WiFi_mac_str);
+          Serial.printf_P(PSTR("[i] IP address     : %s\r\n"), WiFi.localIP().toString().c_str());
+          Serial.printf_P(PSTR("[i] Default Gateway: %s\r\n"), WiFi.gatewayIP().toString().c_str());
+          Serial.printf_P(PSTR("[i] Subnetmask     : %s\r\n"), WiFi.subnetMask().toString().c_str());
+          Serial.printf_P(PSTR("[i] DNS Server1    : %s\r\n"), WiFi.dnsIP(0).toString().c_str());
+          Serial.printf_P(PSTR("[i] DNS Server2    : %s\r\n"), WiFi.dnsIP(1).toString().c_str());
+
+          WiFi.setAutoConnect(false);		//電源再投入時に最後に接続されたAPに自動的に接続するか否か：自動接続しない
+          WiFi.setAutoReconnect(false); //APの接続が切れた場合、自動的に再接続するか否か：自動接続しない（既に接続が切れている時に実行してもAPへの再接続はされない）
+
+          NTP_client->begin();  //NTP Client 開始
+
+          WiFi_state = WIFI_CONNECT_CHK;
+          WiFi_next_state = WIFI_CONNECT_CHK;
+          f_wifi_connected = true;
+          time_sync_start = true;
+
+          f_blynk_connected = false;                                  //Wi-Fi 接続開始後に接続されているので、blynk は接続されていないはず。
+          gn_cnt3 = blynk_reconnect_wait_time = NOF_TICK_CNT(10000);  //10000ms (１０秒) 初回すぐに接続開始させるため
+          microrl_processing_input(&mrl, &init_key, 1);               //プロンプト設定では「>」のみ表示なので、ＬＦを送って「esp8266>」を出力させる
+      }
+      else
+      {	//接続タイムアウトチェック
+        if(0 >= WiFi_ConnectTimeOut_Counter)
+        {   //タイムアウト
+          Serial.printf_P(PSTR("[i] WiFi connect timeout(30s)!\r\n"));
+          wait_time = NOF_TICK_CNT(200); //200ms
+          WiFi_wait_counter = 0;
+
+          WiFi_state = WIFI_WAIT_PROCESS;
+          WiFi_next_state = WIFI_CLIENT_PROC_ENT;
+          f_wifi_connected = false;
+          time_sync_start = false;
+        }
+      }        
+    break;
+
+    case WIFI_CONNECT_CHK:
+      if(WiFi.status() != WL_CONNECTED)
+      {	//接続が切れた
+        Serial.printf_P(PSTR("[i] Now Wi-Fi Disconnected!\r\n"));
+        NTP_client->end();              //NTP Client を終了
+        WIFI_Client->stop();            //TCP通信停止
+
+        wait_time = NOF_TICK_CNT(1000); //1000ms
+        WiFi_wait_counter = 0;
+
+        WiFi_state = WIFI_WAIT_PROCESS;
+        WiFi_next_state = WIFI_CLIENT_PROC_ENT;
+        f_wifi_connected = false;
+        time_sync_start = false;
+
+        now_free_heap_size = ESP.getFreeHeap();
+        Serial.printf_P(PSTR("[i] Free Heap  size: %d\r\n"), (int)now_free_heap_size);   
+      }
+    break;
+
+    case WIFI_WAIT_PROCESS:
+      if(wait_time <= WiFi_wait_counter)
+          WiFi_state = WiFi_next_state;
+    break;     
+
+    default:
+    break;
+  } //switch(WiFi_state)
+
+
+  if(f_wifi_connected)
+  {
+    if(!f_blynk_connected)
+    { //Blynk 未接続状態
+      if(!Blynk.connected())
+      { //Blynk cloud に未接続状態
+        if(blynk_reconnect_wait_time <= gn_cnt3)
+        { //接続トライ
+          Serial.printf_P(PSTR("\r\n[i] Try connecting to Blynk Cloud.\r\n"));
+          Serial.printf_P(PSTR("[!] Program will block here until a Blynk device is connected or a timeout occurs.\r\n"));
+          if(Blynk.connect(8000UL))  //８秒のタイムアウトの設定で　Blynk　接続トライ（ブロッキングされます）
+          { //接続された
+            Serial.printf_P(PSTR("[i] Connected to the Blynk cloud...\r\n"));
+            f_blynk_connected = true;
+          }
+          else
+          { //接続失敗かタイムアウト発生 (１０秒後再接続)
+            Serial.printf_P(PSTR("[e] Failed to connect to the Blynk cloud or a timeout occurred. We will retry in 10 seconds.\r\n"));
+            gn_cnt3 = 0;
+            f_blynk_connected = false;
+          }
+
+          microrl_processing_input(&mrl, &init_key, 1);               //プロンプト設定では「>」のみ表示なので、ＬＦを送って「esp8266>」を出力させる
+        }
+      }
+      else
+      { //既に Blynk cloud に接続状態
+          f_blynk_connected = true;
+      }
+    }
+    else
+    { //Blynk 接続状態
+      if(!Blynk.connected())
+      { //Blynk cloud と切断された
+        Serial.printf_P(PSTR("[!] Blynk Cloud connection has been lost. We will retry in 10 seconds.\r\n"));
+        gn_cnt3 = 0;        
+        f_blynk_connected = false;
+
+        microrl_processing_input(&mrl, &init_key, 1);               //プロンプト設定では「>」のみ表示なので、ＬＦを送って「esp8266>」を出力させる
+      }
+      else
+      { //Blynk cloud 接続維持中
+        Blynk.run();
+      }
+    }    
+  }
+} //void loop()
 
 
 
@@ -235,18 +563,24 @@ void IRAM_ATTR onTickTimerISR(void)
 {
   gn_cnt1++;
   gn_cnt2++;
+  gn_cnt3++;
 
-  if(300 <= gn_cnt1)
+  //ESP8266の時刻更新用
+  if(TICK_COUNTER_PAR_30MIN <= gn_cnt1)
   { //main_work 用のトリガフラグ
     gn_cnt1 = 0;
     f_counter_trigger = true;
   }
 
   if(led_speed <= gn_cnt2)
-  { //ＬＥＤ処理タスク
+  { //ＬＥＤ処理、ＡＤＣサンプルとデジタルデータリード　タスク
     gn_cnt2 = 0;
     tsk_OneShot_01.restart();
   }
+
+  //---
+  WiFi_wait_counter++;
+  WiFi_ConnectTimeOut_Counter--;
 }
 
 
@@ -328,12 +662,42 @@ void MainWork_Callback(void)
     }
   }
 
-  //約１秒ごとの処理があればここに
-  if(f_counter_trigger)
-  { f_counter_trigger = false;
-    #if(0)
-    Serial.printf("TASK: MainWork Proc.\r\n");
-    #endif
+  //ESP8266 内部の時間設定用
+  if(f_wifi_connected && (time_sync_start || f_counter_trigger))
+  {
+    f_counter_trigger = false;
+    time_sync_start = false;
+
+    if(NTP_client->update())  //時刻をサーバーに問合せ。update()は、最大６０秒１回なので同期されるまで最大で６０秒待たされる。
+    { //サーバーと同期がとれた
+      struct timeval time_value;
+      struct tm* now_time;
+      time_t epoch = NTP_client->getEpochTime();
+      time_value.tv_sec = epoch;
+      time_value.tv_usec = 0;
+      settimeofday(&time_value, NULL); //ESP8266 に時間をセット
+
+      //セット後にESP8266から時刻取得し表示
+      if(0 == gettimeofday(&time_value, NULL))
+      { //成功
+        epoch = time_value.tv_sec;
+        now_time = localtime(&epoch);
+        Serial.printf_P(PSTR("[Time sync] %04d/%02d/%02d (%s) %02d:%02d:%02d\r\n"),
+                      now_time->tm_year + 1900, //1900年からの経過年
+                      now_time->tm_mon + 1,     //0(1月)〜11(12月)
+                      now_time->tm_mday,
+                      weekd[now_time->tm_wday],
+                      now_time->tm_hour,
+                      now_time->tm_min,
+                      now_time->tm_sec);
+      }
+      else
+      { //失敗
+        Serial.printf_P(PSTR("[e] Read operation failed after the time was set.\r\n"));
+      }
+
+      microrl_processing_input(&mrl, &init_key, 1); //プロンプト設定では「>」のみ表示なので、ＬＦを送って「esp8266>」を出力させる
+    }
   }
 
   //赤外線の受信データがあるか確認
@@ -368,16 +732,63 @@ void MainWork_Callback(void)
 
 
 /**
- * @brief ＬＥＤの点滅処理タスク
+ * @brief ＬＥＤの点滅、ＡＤＣサンプルとデジタルデータリード処理タスク
  *        ティックタイマー割込みの「リスタート」で処理が行われる
  *        処理が終わるとタスクは、disable（休止状態）
  */
 void TskOneShot_LEDproc_Callback(void)
 {
   static uint8_t led_onoff_cnt = 0;
+  static int8_t  add_cnt = 0;
+  static uint32_t adc_dfata = 0;
+  static uint8_t cnt1 = 0;
+  static int send_adc_data = 0;
+  static int send_di_io0 = 0;
 
+  //ＬＥＤ点滅
   digitalWrite(LED_PIN, (uint8_t)(led_onoff_cnt & 0x01));
   led_onoff_cnt++;
+
+  //ＡＤコンバート、ＳＷ２ボタン読込
+  if(40 <= ++cnt1)
+  { //４０サイクルに１回変換 （500msの設定の場合、20秒に１回、３回の平均は１分かかる）
+    adc_dfata += (uint32_t)ESP8266_ADC_READ;
+    add_cnt++;
+    if(3 <= add_cnt)
+    { //３回サンプリングの平均
+      #if(ADC_VCC_MODE)
+      send_adc_data = (int)(adc_dfata / 3);
+      #else
+      send_adc_data = (int)((((float)adc_dfata / 3.0F) * ADC_A0_1LSB_MV) + 0.5F);
+      #endif
+      send_di_io0 = (digitalRead(IO0_PIN))? 0 : 1;
+
+      //Blynk Cloud にデータ送信
+      if(f_blynk_connected)
+      { //Blynk Cloud に接続されている状態
+        #if(0)
+        Serial.printf("\r\n[i] ESP-WROOM A0: %d[mV], GPIO0-IN:%d\r\n", send_adc_data, send_di_io0);
+        #endif
+        if(f_blynk_send_data)
+        { Serial.printf("\r\n[i] ESP-WROOM A0: %d[mV], GPIO0-IN:%d\r\n", send_adc_data, send_di_io0);
+          Serial.printf_P(PSTR("[i] Send data to Blynk Cloud.\r\n"));
+          Blynk.virtualWrite(V10, send_adc_data);
+          Blynk.virtualWrite(V11, send_di_io0);
+
+          microrl_processing_input(&mrl, &init_key, 1); //プロンプト設定では「>」のみ表示なので、ＬＦを送って「esp8266>」を出力させる
+        }
+      }
+      #if(0)
+      else
+      { //Blynk Cloud に未接続
+        Serial.printf_P(PSTR("[!] Data will not be sent because it is not connected to the Blynk Cloud.\r\n"));
+      }
+      #endif
+      add_cnt = 0;
+      adc_dfata = 0;
+    }
+    cnt1 = 0;
+  }
 }
 
 
@@ -393,13 +804,36 @@ int microRL_executeCallback(microrl_t* mrl, int argc, const char* const* argv)
   // テーブル内を検索
   for(size_t i = 0; i < sizeof(commands)/sizeof(command_t); i++)
   { if(strcmp(argv[0], commands[i].name) == 0)
-    { commands[i].func(argc, argv);                           //一致したら関数呼び出し
+    { commands[i].func(argc, argv);                                       //一致した関数呼び出し
       return 0;
     }
   }
   Serial.printf_P(PSTR("Unknown command. Type 'help' for info.\r\n"));   //コマンド一致するものがなかった
   return 0;
 }
+
+/**
+ * @brief Construct a new blynk write object
+ *        V2ピンに動きがあった時に実行される
+ */
+BLYNK_WRITE(V2)
+{
+  //受け取ったデータを変数に保存
+  int value = param.asInt();                      //整数として取得 (0か1、またはスライダーの値)
+
+  if(value == 1)
+  { //赤外線データを出力する
+    Serial.printf_P(PSTR("[i] IR Send: SONY TV Power...\r\n"));
+    irsend.send(SONY, 0x0A90, 12, 0U);
+  }
+  else
+  { //何もしない
+    Serial.printf_P(PSTR("[i] V2 Button OFF!\r\n"));
+  }
+
+  microrl_processing_input(&mrl, &init_key, 1); //プロンプト設定では「>」のみ表示なので、ＬＦを送って「esp8266>」を出力させる
+}
+
 
 
 //----コマンド処理関数 ---------------------------------------------------------------------------------
@@ -1824,6 +2258,72 @@ void cmd_fs_remove_ir(int argc, const char* const* argv)
   }
 }
 
+/**
+ * @brief Blynk Cloud にデータを送信するか否か
+ * 
+ * @param argc コマンドとパラメーターの数
+ * @param argv コマンド、ON/OFF
+ */
+void cmd_send2blynk(int argc, const char* const* argv)
+{
+  if(argc != 2)
+  { Serial.printf_P(PSTR("Usage: snd2bc <on/off>\r\n"));
+    Serial.printf_P(PSTR("The transmission interval is 120x the LED blink setting value.\r\n"));
+    return;
+  }
+
+  if(0 == (strcmp("on", argv[1])))
+  { Serial.printf_P(PSTR("Enabled data uploads to the Blynk cloud.\r\n"));
+    Serial.printf_P(PSTR("The transmission interval is 120x the LED blink setting value.\r\n"));
+    f_blynk_send_data = true;
+  } else
+
+  if(0 == (strcmp("off", argv[1])))
+  { Serial.printf_P(PSTR("Disabled data uploads to the Blynk cloud.\r\n"));
+    f_blynk_send_data = false;
+  }
+  else
+  { Serial.printf_P(PSTR("Usage: snd2bc <on/off>\r\n"));
+    Serial.printf_P(PSTR("The transmission interval is 120x the LED blink setting value.\r\n"));
+  }
+}
+
+/**
+ * @brief 現在の時刻表示
+ * 
+ * @param argc コマンドとパラメーターの数
+ * @param argv コマンド
+ */
+void cmd_get_now_time(int argc, const char* const* argv)
+{
+  struct timeval time_value;
+  struct tm* now_time;
+  time_t epoch;
+
+  if(argc != 1)
+  { Serial.printf_P(PSTR("Usage: ntim\r\n"));
+    return;
+  }
+
+  //ESP8266から時刻取得し表示
+  if(0 == gettimeofday(&time_value, NULL))
+  { //成功
+    epoch = time_value.tv_sec;
+    now_time = localtime(&epoch);
+    Serial.printf_P(PSTR("[Now Time] %04d/%02d/%02d (%s) %02d:%02d:%02d\r\n"),
+                  now_time->tm_year + 1900, //1900年からの経過年
+                  now_time->tm_mon + 1,     //0(1月)〜11(12月)
+                  now_time->tm_mday,
+                  weekd[now_time->tm_wday],
+                  now_time->tm_hour,
+                  now_time->tm_min,
+                  now_time->tm_sec);
+  }
+  else
+  { //失敗
+    Serial.printf_P(PSTR("[e] Operation failed!\r\n"));
+  }
+}
 
 
 //---- 処理関数 -------------------------------------------------------------------------------------
